@@ -16,10 +16,10 @@ app.use(express.json());
 // ----------------------------------------------------------------------------
 // CONFIGURAÇÃO (vem das variáveis de ambiente do Render — nunca no código)
 // ----------------------------------------------------------------------------
-const ZAPI_INSTANCE = process.env.ZAPI_INSTANCE;
-const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
-const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN;
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const ZAPI_INSTANCE = process.env.ZAPI_INSTANCE;     // Instance ID da Z-API
+const ZAPI_TOKEN = process.env.ZAPI_TOKEN;           // Token da instância
+const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN; // Client-Token (segurança)
+const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;   // Chave da Anthropic
 
 const ZAPI_BASE = `https://api.z-api.io/instances/${ZAPI_INSTANCE}/token/${ZAPI_TOKEN}`;
 const CLAUDE_MODEL = "claude-haiku-4-5";
@@ -29,24 +29,42 @@ const NUMERO_INTERNO = process.env.NUMERO_INTERNO || "";
 
 // ----------------------------------------------------------------------------
 // MEMÓRIA EM TEMPO DE EXECUÇÃO
+// (Obs: zera quando o Render reinicia/hiberna. Suficiente para conversas curtas.
+//  Para persistência real, trocar por banco depois.)
 // ----------------------------------------------------------------------------
 const sessoes = {};
 
+// Guarda os textos que o PRÓPRIO bot enviou, por telefone, para não
+// confundir o eco da Z-API ("ao enviar") com um humano respondendo.
+const enviadasPeloBot = {}; // { telefone: Set<string> }
+
+function registrarEnvioBot(telefone, texto) {
+  if (!enviadasPeloBot[telefone]) enviadasPeloBot[telefone] = new Set();
+  enviadasPeloBot[telefone].add((texto || "").trim());
+}
+
+function foiEnviadaPeloBot(telefone, texto) {
+  const set = enviadasPeloBot[telefone];
+  if (!set) return false;
+  return set.has((texto || "").trim());
+}
+
 function hojeStr() {
-  return new Date().toISOString().slice(0, 10);
+  return new Date().toISOString().slice(0, 10); // "2026-06-19"
 }
 
 function getSessao(telefone) {
   if (!sessoes[telefone]) {
     sessoes[telefone] = {
       historico: [],
-      silenciadoEm: null,
+      silenciadoEm: null,   // data (string) em que o humano assumiu
       coletaFinalizada: false,
     };
   }
   return sessoes[telefone];
 }
 
+// O bot está silenciado para este cliente se um humano respondeu HOJE
 function estaSilenciado(sessao) {
   return sessao.silenciadoEm === hojeStr();
 }
@@ -63,7 +81,7 @@ REGRA MAIS IMPORTANTE — NUNCA QUEBRAR:
 - NUNCA invente informações sobre a empresa que você não tem.
 - Se não souber algo, diga que o vendedor vai esclarecer.
 
-DADOS QUE VOCÊ PRECISA COLETAR (5 itens):
+DADOS QUE VOCÊ PRECISA COLETAR (6 itens):
 1. Tipo de gás ou produto (ex: oxigênio, acetileno, argônio, CO2, oxigênio medicinal, abrasivos)
 2. Se é recarga, locação ou compra
 3. Tamanho e quantidade de cilindros
@@ -111,6 +129,7 @@ async function perguntarClaude(historico) {
 // ENVIAR MENSAGEM PELO WHATSAPP (Z-API)
 // ----------------------------------------------------------------------------
 async function enviarWhatsApp(telefone, mensagem) {
+  registrarEnvioBot(telefone, mensagem);
   await axios.post(
     `${ZAPI_BASE}/send-text`,
     { phone: telefone, message: mensagem },
@@ -122,44 +141,65 @@ async function enviarWhatsApp(telefone, mensagem) {
 // WEBHOOK — recebe os eventos da Z-API
 // ----------------------------------------------------------------------------
 app.post("/webhook", async (req, res) => {
+  // Responde rápido para a Z-API não reenviar
   res.sendStatus(200);
 
   try {
     const body = req.body || {};
     const telefone = body.phone;
     if (!telefone) return;
-    if (body.isGroup) return;
 
-    // Caso 1: mensagem ENVIADA pela loja (humano assumiu)
+    // Ignora newsletters, canais e grupos — só atende conversa 1-a-1 de cliente.
+    if (
+      body.isGroup ||
+      body.isNewsletter ||
+      String(telefone).includes("@newsletter") ||
+      String(telefone).includes("@broadcast") ||
+      String(telefone).includes("-")
+    ) {
+      return;
+    }
+
+    const texto = body.text?.message || body.message || "";
+
+    // ----- Caso 1: mensagem ENVIADA pelo número da loja -----
     if (body.fromMe === true) {
+      // Se foi o PRÓPRIO bot que enviou, ignora (é só o eco da Z-API).
+      if (foiEnviadaPeloBot(telefone, texto)) {
+        return;
+      }
+      // Senão, foi um humano (você/Lorenn) digitando: ativa o silêncio.
       const s = getSessao(telefone);
       s.silenciadoEm = hojeStr();
       console.log(`🤐 Humano respondeu ${telefone} — bot silenciado hoje.`);
       return;
     }
 
-    // Caso 2: mensagem RECEBIDA do cliente
-    const texto = body.text?.message || body.message || "";
+    // ----- Caso 2: mensagem RECEBIDA do cliente -----
     if (!texto) return;
 
     console.log(`📩 Mensagem de ${telefone}: ${texto}`);
 
     const sessao = getSessao(telefone);
 
+    // Se um humano já assumiu hoje, o bot fica quieto
     if (estaSilenciado(sessao)) {
       console.log(`⏸️ Bot silenciado para ${telefone} hoje. Ignorando.`);
       return;
     }
 
+    // Se a coleta já foi finalizada, não fica repetindo — aguarda o vendedor
     if (sessao.coletaFinalizada) {
       console.log(`✅ Coleta já finalizada para ${telefone}. Aguardando vendedor.`);
       return;
     }
 
+    // Monta o histórico para o Claude
     sessao.historico.push({ role: "user", content: texto });
 
     let resposta = await perguntarClaude(sessao.historico);
 
+    // Detecta o fim da coleta
     const coletou = resposta.includes("[COLETA_COMPLETA]");
     if (coletou) {
       resposta = resposta.replace("[COLETA_COMPLETA]", "").trim();
@@ -168,8 +208,10 @@ app.post("/webhook", async (req, res) => {
 
     sessao.historico.push({ role: "assistant", content: resposta });
 
+    // Envia a resposta ao cliente
     await enviarWhatsApp(telefone, resposta);
 
+    // Se finalizou a coleta, manda o resumo para o número interno da loja
     if (coletou && NUMERO_INTERNO) {
       const resumo =
         `🟢 *NOVA DEMANDA — ${telefone}*\n\n` +
