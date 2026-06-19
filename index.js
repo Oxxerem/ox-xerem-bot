@@ -1,167 +1,193 @@
+/**
+ * BOT WHATSAPP — OX XERÉM
+ * Conceito: acolhimento + coleta de dados para orçamento.
+ * O bot NÃO dá preço. Ele acolhe, coleta 6 dados e repassa para o vendedor.
+ * Quando um humano (loja) responde o cliente, o bot silencia até o dia seguinte.
+ *
+ * Stack: Node.js + Express + Z-API + Claude (Anthropic)
+ */
+
 const express = require("express");
 const axios = require("axios");
 
 const app = express();
 app.use(express.json());
 
-// ─── CONFIGURAÇÕES DA Z-API ───────────────────────────────────────────────────
-const INSTANCE_ID = "3EFC675DA5F911D6DF46FE76949B0C27";
-const TOKEN = "2374F9C420BB072E543B8C6A";
-const CLIENT_TOKEN = "Fc7687995007f4c7696d5f220c73446ffS";
-const ZAPI_URL = `https://api.z-api.io/instances/${INSTANCE_ID}/token/${TOKEN}`;
-
-// ─── CONFIGURAÇÕES DO CLAUDE ──────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
+// CONFIGURAÇÃO (vem das variáveis de ambiente do Render — nunca no código)
+// ----------------------------------------------------------------------------
+const ZAPI_INSTANCE = process.env.ZAPI_INSTANCE;
+const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
+const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-const CLAUDE_URL = "https://api.anthropic.com/v1/messages";
 
-const SYSTEM_PROMPT = `Você é um atendente virtual da Ox Xerém, empresa especializada em distribuição de gases industriais e medicinais, abrasivos e materiais de oxicorte, localizada em Xerém, Duque de Caxias - RJ.
+const ZAPI_BASE = `https://api.z-api.io/instances/${ZAPI_INSTANCE}/token/${ZAPI_TOKEN}`;
+const CLAUDE_MODEL = "claude-haiku-4-5";
 
-Responda sempre de forma simpática, objetiva e profissional, como um atendente humano da empresa.
+// Número da loja para receber o resumo da demanda (formato: 5521999999999)
+const NUMERO_INTERNO = process.env.NUMERO_INTERNO || "";
 
-Informações da empresa:
-- Produtos: oxigênio industrial e medicinal, acetileno, argônio, CO2, nitrogênio, mistura para solda, abrasivos e materiais de oxicorte
-- Localização: Xerém, Duque de Caxias - RJ
-- Horário: Segunda a Sexta 08h às 18h, Sábado 08h às 12h
-- Entregamos cilindros na região
-- Trabalhamos com locação de cilindros mediante contrato
+// ----------------------------------------------------------------------------
+// MEMÓRIA EM TEMPO DE EXECUÇÃO
+// ----------------------------------------------------------------------------
+const sessoes = {};
 
-Se o cliente perguntar sobre preços específicos, diga que um atendente entrará em contato para passar os valores atualizados.
-Se o cliente quiser falar com um humano, diga que em breve um atendente retornará.
-Mantenha as respostas curtas (máximo 3 parágrafos).
-Responda sempre em português.`;
-
-// ─── FUNÇÕES DE ENVIO ─────────────────────────────────────────────────────────
-
-async function enviarMensagem(telefone, mensagem) {
-  try {
-    const response = await axios.post(`${ZAPI_URL}/send-text`, {
-      phone: telefone,
-      message: mensagem,
-    }, {
-      headers: {
-        "Client-Token": CLIENT_TOKEN,
-        "Content-Type": "application/json"
-      }
-    });
-    console.log("✅ Mensagem enviada:", response.data);
-  } catch (err) {
-    console.error("Erro ao enviar mensagem:", err.response?.data || err.message);
-  }
+function hojeStr() {
+  return new Date().toISOString().slice(0, 10);
 }
 
-async function perguntarClaude(mensagem) {
-  try {
-    const response = await axios.post(CLAUDE_URL, {
-      model: "claude-haiku-4-5",
-      max_tokens: 300,
+function getSessao(telefone) {
+  if (!sessoes[telefone]) {
+    sessoes[telefone] = {
+      historico: [],
+      silenciadoEm: null,
+      coletaFinalizada: false,
+    };
+  }
+  return sessoes[telefone];
+}
+
+function estaSilenciado(sessao) {
+  return sessao.silenciadoEm === hojeStr();
+}
+
+// ----------------------------------------------------------------------------
+// PROMPT DO CLAUDE — o "cérebro" do bot
+// ----------------------------------------------------------------------------
+const SYSTEM_PROMPT = `Você é o atendente virtual de acolhimento da Ox Xerém, uma distribuidora de gases industriais e medicinais em Xerém, Duque de Caxias (RJ). A empresa vende e recarrega gases em cilindros, faz locação de cilindros e vende abrasivos e materiais de oxicorte.
+
+SEU ÚNICO PAPEL é acolher o cliente e coletar as informações abaixo para que um VENDEDOR humano prepare o orçamento. Você NÃO é vendedor.
+
+REGRA MAIS IMPORTANTE — NUNCA QUEBRAR:
+- NUNCA informe preços, valores, valor do m³, prazos de entrega ou descontos. O preço varia por cliente e só o vendedor pode calcular. Se o cliente perguntar preço, responda gentilmente que o vendedor vai analisar e retornar com o valor.
+- NUNCA invente informações sobre a empresa que você não tem.
+- Se não souber algo, diga que o vendedor vai esclarecer.
+
+DADOS QUE VOCÊ PRECISA COLETAR (5 itens):
+1. Tipo de gás ou produto (ex: oxigênio, acetileno, argônio, CO2, oxigênio medicinal, abrasivos)
+2. Se é recarga, locação ou compra
+3. Tamanho e quantidade de cilindros
+4. Bairro / local de entrega
+5. Se o orçamento é para CPF (pessoa física) ou CNPJ (empresa)
+
+COMO AGIR:
+- Seja acolhedor, direto e breve. Use no máximo 1 emoji por mensagem.
+- O cliente já pode ter dado parte das informações na primeira mensagem. NÃO peça o que ele já informou. Pergunte só o que falta.
+- Faça no máximo 2 perguntas por mensagem para não cansar.
+- Quando tiver TODOS os 5 dados, encerre dizendo que vai repassar para um vendedor analisar e retornar com o orçamento, e adicione no final da sua mensagem, em uma linha separada, exatamente o marcador: [COLETA_COMPLETA]
+- O marcador [COLETA_COMPLETA] só pode aparecer quando você tiver os 5 dados. Nunca antes.
+
+Responda sempre em português do Brasil.`;
+
+// ----------------------------------------------------------------------------
+// CHAMADA AO CLAUDE
+// ----------------------------------------------------------------------------
+async function perguntarClaude(historico) {
+  const resp = await axios.post(
+    "https://api.anthropic.com/v1/messages",
+    {
+      model: CLAUDE_MODEL,
+      max_tokens: 400,
       system: SYSTEM_PROMPT,
-      messages: [
-        { role: "user", content: mensagem }
-      ]
-    }, {
+      messages: historico,
+    },
+    {
       headers: {
         "x-api-key": CLAUDE_API_KEY,
         "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-      }
-    });
-    return response.data.content[0].text;
-  } catch (err) {
-    console.error("Erro ao consultar Claude:", err.response?.data || err.message);
-    return "Olá! No momento estou com dificuldades técnicas. Por favor, aguarde que um atendente entrará em contato em breve! 😊";
-  }
+        "content-type": "application/json",
+      },
+    }
+  );
+  const blocos = resp.data.content || [];
+  return blocos
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
 }
 
-// ─── MENU PRINCIPAL ───────────────────────────────────────────────────────────
+// ----------------------------------------------------------------------------
+// ENVIAR MENSAGEM PELO WHATSAPP (Z-API)
+// ----------------------------------------------------------------------------
+async function enviarWhatsApp(telefone, mensagem) {
+  await axios.post(
+    `${ZAPI_BASE}/send-text`,
+    { phone: telefone, message: mensagem },
+    { headers: { "Client-Token": ZAPI_CLIENT_TOKEN } }
+  );
+}
 
-const SAUDACAO = `Olá! 👋 Bem-vindo à *Ox Xerém*!
-
-Como podemos te ajudar hoje? Digite o número da opção desejada:
-
-1️⃣ - Informações e Horário de funcionamento
-3️⃣ - Orçamento / Vendas
-5️⃣ - Falar com o Financeiro
-
-_Ou digite sua dúvida diretamente que responderemos! 😊_`;
-
-const RESPOSTAS = {
-  "1": `🕐 *Informações & Horário - Ox Xerém*
-
-📍 Estamos localizados em Xerém, Duque de Caxias - RJ
-
-🗓 *Horário de funcionamento:*
-• Segunda a Sexta: 08h às 18h
-• Sábado: 08h às 12h
-• Domingo: Fechado
-
-Em caso de dúvidas, responda este menu ou aguarde atendimento. 😊
-
-_Digite * para voltar ao menu._`,
-
-  "3": `💼 *Orçamento / Vendas - Ox Xerém*
-
-Ficamos felizes com seu interesse! 🎉
-
-Para solicitar um orçamento, por favor nos informe:
-• Produto ou serviço desejado
-• Quantidade
-• Prazo necessário
-
-Nossa equipe de vendas retornará em breve! 📲
-
-_Digite * para voltar ao menu._`,
-
-  "5": `💰 *Financeiro - Ox Xerém*
-
-Você será direcionado ao setor financeiro.
-
-Por favor, informe:
-• Seu nome completo
-• Número do pedido ou NF (se tiver)
-• Assunto da solicitação
-
-Um atendente do financeiro entrará em contato em breve! ✅
-
-_Digite * para voltar ao menu._`,
-};
-
-// ─── WEBHOOK ──────────────────────────────────────────────────────────────────
-
+// ----------------------------------------------------------------------------
+// WEBHOOK — recebe os eventos da Z-API
+// ----------------------------------------------------------------------------
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
-  const body = req.body;
+  try {
+    const body = req.body || {};
+    const telefone = body.phone;
+    if (!telefone) return;
+    if (body.isGroup) return;
 
-  if (body.fromMe) return;
-  if (body.isGroup) return;
+    // Caso 1: mensagem ENVIADA pela loja (humano assumiu)
+    if (body.fromMe === true) {
+      const s = getSessao(telefone);
+      s.silenciadoEm = hojeStr();
+      console.log(`🤐 Humano respondeu ${telefone} — bot silenciado hoje.`);
+      return;
+    }
 
-  const telefone = body.phone;
-  const texto = (body.text?.message || "").trim();
+    // Caso 2: mensagem RECEBIDA do cliente
+    const texto = body.text?.message || body.message || "";
+    if (!texto) return;
 
-  console.log(`📩 Mensagem de ${telefone}: "${texto}"`);
+    console.log(`📩 Mensagem de ${telefone}: ${texto}`);
 
-  // Volta ao menu se digitar *
-  if (texto === "*") {
-    await enviarMensagem(telefone, SAUDACAO);
-    return;
+    const sessao = getSessao(telefone);
+
+    if (estaSilenciado(sessao)) {
+      console.log(`⏸️ Bot silenciado para ${telefone} hoje. Ignorando.`);
+      return;
+    }
+
+    if (sessao.coletaFinalizada) {
+      console.log(`✅ Coleta já finalizada para ${telefone}. Aguardando vendedor.`);
+      return;
+    }
+
+    sessao.historico.push({ role: "user", content: texto });
+
+    let resposta = await perguntarClaude(sessao.historico);
+
+    const coletou = resposta.includes("[COLETA_COMPLETA]");
+    if (coletou) {
+      resposta = resposta.replace("[COLETA_COMPLETA]", "").trim();
+      sessao.coletaFinalizada = true;
+    }
+
+    sessao.historico.push({ role: "assistant", content: resposta });
+
+    await enviarWhatsApp(telefone, resposta);
+
+    if (coletou && NUMERO_INTERNO) {
+      const resumo =
+        `🟢 *NOVA DEMANDA — ${telefone}*\n\n` +
+        `Resumo da conversa de acolhimento:\n\n` +
+        sessao.historico
+          .map((m) => (m.role === "user" ? `Cliente: ${m.content}` : `Bot: ${m.content}`))
+          .join("\n") +
+        `\n\n👉 Vendedor: analisar e retornar com orçamento.`;
+      await enviarWhatsApp(NUMERO_INTERNO, resumo);
+      console.log(`📤 Resumo enviado para a loja sobre ${telefone}.`);
+    }
+  } catch (err) {
+    console.error("❌ Erro no webhook:", err.response?.data || err.message);
   }
-
-  // Responde conforme a opção do menu
-  if (RESPOSTAS[texto]) {
-    await enviarMensagem(telefone, RESPOSTAS[texto]);
-    return;
-  }
-
-  // Mensagem livre → responde com Claude AI
-  console.log(`🤖 Consultando Claude para: "${texto}"`);
-  const respostaClaude = await perguntarClaude(texto);
-  await enviarMensagem(telefone, respostaClaude);
 });
 
-// ─── INICIAR SERVIDOR ─────────────────────────────────────────────────────────
+// Rota de saúde (útil para "acordar" o Render e testar)
+app.get("/", (_req, res) => res.send("Bot Ox Xerém no ar 🟢"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Bot da Ox Xerém rodando na porta ${PORT}`);
-  console.log(`📡 Webhook pronto em: http://localhost:${PORT}/webhook`);
-});
+app.listen(PORT, () => console.log(`🚀 Bot rodando na porta ${PORT}`));
