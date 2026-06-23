@@ -6,9 +6,9 @@
  *
  * Stack: Node.js + Express + Z-API + Claude (Anthropic)
  *
- * >>> VERSÃO COM RAIO-X DE DIAGNÓSTICO <<<
- * Esta versão imprime o evento completo da Z-API no log, para identificarmos
- * o formato do número quando um humano envia manualmente. Será removido depois.
+ * CHAVE DA CONVERSA: usamos chatLid (identificador fixo da conversa), porque
+ * o campo phone vem corrompido quando a loja responde manualmente.
+ * BOT vs HUMANO: distinguido por fromApi (true = bot via API; false = humano digitando).
  */
 
 const express = require("express");
@@ -18,7 +18,7 @@ const app = express();
 app.use(express.json());
 
 // ----------------------------------------------------------------------------
-// CONFIGURAÇÃO
+// CONFIGURAÇÃO (vem das variáveis de ambiente do Render — nunca no código)
 // ----------------------------------------------------------------------------
 const ZAPI_INSTANCE = process.env.ZAPI_INSTANCE;
 const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
@@ -30,22 +30,228 @@ const CLAUDE_MODEL = "claude-haiku-4-5";
 const NUMERO_INTERNO = process.env.NUMERO_INTERNO || "";
 
 // ----------------------------------------------------------------------------
-// WEBHOOK — RAIO-X: imprime o evento inteiro
+// MEMÓRIA EM TEMPO DE EXECUÇÃO
+// (Zera quando o Render reinicia. Suficiente para conversas curtas.)
+// As sessões são indexadas pelo chatLid (chave fixa da conversa).
+// ----------------------------------------------------------------------------
+const sessoes = {};
+
+function hojeStr() {
+  return new Date().toISOString().slice(0, 10); // "2026-06-23"
+}
+
+function getSessao(chave) {
+  if (!sessoes[chave]) {
+    sessoes[chave] = {
+      historico: [],
+      silenciadoEm: null,    // data (string) em que o humano assumiu
+      coletaFinalizada: false,
+      ultimoProcessado: null, // messageId já tratado (evita duplicar)
+    };
+  }
+  return sessoes[chave];
+}
+
+function estaSilenciado(sessao) {
+  return sessao.silenciadoEm === hojeStr();
+}
+
+// ----------------------------------------------------------------------------
+// PROMPT DO CLAUDE — o "cérebro" do bot
+// ----------------------------------------------------------------------------
+const SYSTEM_PROMPT = `Você é o atendente virtual de acolhimento da Ox Xerém, distribuidora de gases industriais e medicinais, abrasivos e materiais de oxicorte, em Xerém, Duque de Caxias (RJ).
+
+SEU ÚNICO PAPEL é acolher o cliente e reunir as informações do pedido para que a equipe da Ox Xerém prepare o orçamento. Você NÃO é vendedor e NÃO fecha negócio.
+
+═══════════════════════════════════
+REGRA DE PREÇO — NUNCA QUEBRAR
+═══════════════════════════════════
+- NUNCA informe preços, valores, valor do m³, valor do kg, prazos ou descontos.
+- Se o cliente perguntar o preço, responda de forma simples e natural que você está reunindo as informações do pedido para a equipe preparar o orçamento e enviar o valor correto.
+- NUNCA explique o MOTIVO de não dar o preço. NÃO diga que "o preço varia conforme cliente/quantidade", nem cite nenhum critério de precificação. Apenas diga que vai reunir os dados e a equipe envia o valor. Esse motivo é informação interna — o cliente não deve vê-la.
+- NUNCA invente informações sobre a empresa. Se não souber algo, diga que a equipe vai esclarecer.
+
+═══════════════════════════════════
+O QUE A OX XERÉM FAZ
+═══════════════════════════════════
+- ALUGUEL (locação) de cilindros
+- RECARGA por livre troca: o cliente traz o cilindro vazio e troca por um cheio (lógica de "casco", igual engradado de bebida)
+- ABASTECIMENTO do cilindro próprio do cliente
+NÃO investigue a fundo qual dos três é. Se o cliente disser, anote. Se não disser, tudo bem — a equipe resolve isso na conversa do orçamento. Não faça interrogatório sobre isso.
+
+═══════════════════════════════════
+PRODUTOS E MEDIDAS (use a medida certa conforme o gás)
+═══════════════════════════════════
+GASES POR METRO CÚBICO (m³) — opções comuns: 1, 1,5, 7, 8 ou 10 m³:
+- Oxigênio · Argônio · Mistura · Nitrogênio
+  → o cilindro de 1 m³ é chamado de "PPU" (ex: PPU de oxigênio). O padrão/mais comum é o de 10 m³.
+- Hélio → vendido por m³; pergunte quantos m³ o cliente quer (normalmente 1 m³; quando é mais, costuma ser quem trabalha com o produto).
+
+GASES POR QUILO (kg):
+- CO2 (dióxido de carbono) → garrafa pequena de 6 kg; garrafa grande de 20, 23 ou 25 kg (padrão 25 kg).
+- Acetileno → o de 1 kg é o "PPU de acetileno"; a garrafa maior é só de 7 kg (não há outras medidas).
+
+Ao perguntar o tamanho, ofereça SOMENTE as opções do gás que o cliente pediu (m³ para os gases de metro cúbico; kg para CO2 e acetileno). Nunca pergunte "m³" para acetileno/CO2, nem "kg" para oxigênio.
+
+═══════════════════════════════════
+DADOS A REUNIR
+═══════════════════════════════════
+1. Qual gás/produto
+2. Tamanho do cilindro (na medida certa conforme o gás)
+3. Quantidade de cilindros
+4. Bairro / endereço de entrega (ou se o cliente vai retirar no local)
+5. Se o orçamento é para CPF (pessoa física) ou CNPJ (empresa)
+6. Tipo de operação: aluguel, recarga (livre troca) ou abastecimento de cilindro próprio — NÃO pergunte isso diretamente nem faça interrogatório. Apenas capte do que o cliente disser naturalmente (ex: se ele mencionar que tem cilindro próprio, ou que vai trocar). Se não der para saber, registre como "a confirmar" no resumo.
+
+═══════════════════════════════════
+COMO AGIR
+═══════════════════════════════════
+- Seja acolhedor, direto e PROFISSIONAL. O ramo é de gases — mantenha postura séria e confiável.
+- EMOJIS: use no MÁXIMO 1 emoji APENAS na saudação inicial e APENAS na mensagem final (encerramento/resumo). No meio da conversa — perguntas, confirmações, coleta de dados — NÃO use nenhum emoji. Nunca use emojis de fogo, chama ou explosão, pois muitos gases são inflamáveis e isso passa imagem inadequada.
+- RESPOSTAS BEM ORGANIZADAS: use negrito (*texto*) para destacar, quebras de linha e itens numerados quando listar perguntas. O cliente deve entender de imediato.
+- Faça no máximo 2 perguntas por mensagem.
+- O cliente pode já ter dado parte das informações. NÃO repita o que ele já informou; pergunte só o que falta.
+- NÃO fique insistindo nem repetindo a mesma pergunta. Se depois de perguntar uma vez o cliente responder de forma confusa ou incompleta, anote do jeito que ele falou e siga em frente — quem esclarece é a equipe.
+- Se o cliente pedir algo fora do padrão, ou disser algo que você não entendeu bem, NÃO descarte e NÃO force: registre exatamente como ele falou e repasse para a equipe.
+
+═══════════════════════════════════
+ENCERRAMENTO
+═══════════════════════════════════
+- Quando tiver reunido o suficiente (idealmente os dados acima, mas sem ficar insistindo se o cliente não colaborar), faça um resumo limpo e organizado do pedido, avise que vai repassar para a equipe preparar o orçamento e enviar o valor correto, e adicione na última linha, sozinho, exatamente o marcador: [COLETA_COMPLETA]
+- No resumo, inclua o MÁXIMO de informação, inclusive o que ficou em aberto ou não foi confirmado (ex: "tamanho não confirmado pelo cliente").
+- O marcador [COLETA_COMPLETA] nunca aparece antes do resumo final.
+
+Responda sempre em português do Brasil.`;
+
+// ----------------------------------------------------------------------------
+// CHAMADA AO CLAUDE
+// ----------------------------------------------------------------------------
+async function perguntarClaude(historico) {
+  const resp = await axios.post(
+    "https://api.anthropic.com/v1/messages",
+    {
+      model: CLAUDE_MODEL,
+      max_tokens: 400,
+      system: SYSTEM_PROMPT,
+      messages: historico,
+    },
+    {
+      headers: {
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+    }
+  );
+  const blocos = resp.data.content || [];
+  return blocos
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+// ----------------------------------------------------------------------------
+// ENVIAR MENSAGEM PELO WHATSAPP (Z-API)
+// ----------------------------------------------------------------------------
+async function enviarWhatsApp(telefone, mensagem) {
+  await axios.post(
+    `${ZAPI_BASE}/send-text`,
+    { phone: telefone, message: mensagem },
+    { headers: { "Client-Token": ZAPI_CLIENT_TOKEN } }
+  );
+}
+
+// ----------------------------------------------------------------------------
+// WEBHOOK — recebe os eventos da Z-API
 // ----------------------------------------------------------------------------
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // responde rápido para a Z-API não reenviar
+
   try {
     const body = req.body || {};
-    // Imprime o evento completo, formatado, para análise.
-    console.log("===== EVENTO Z-API =====");
-    console.log(JSON.stringify(body, null, 2));
-    console.log("========================");
+
+    // Ignora newsletters, canais e grupos
+    if (body.isGroup || body.isNewsletter || body.broadcast) return;
+
+    // CHAVE DA CONVERSA: chatLid é fixo e igual para cliente e loja.
+    // Caso falte, cai para o phone.
+    const chave = body.chatLid || body.phone;
+    if (!chave) return;
+
+    const texto = body.text?.message || "";
+
+    // ----- Caso 1: mensagem ENVIADA pelo número da loja (fromMe = true) -----
+    if (body.fromMe === true) {
+      // fromApi=true  -> foi o próprio bot (via API). Ignorar, não é humano.
+      // fromApi=false -> foi um humano digitando no celular. Silenciar.
+      if (body.fromApi === true) {
+        return; // eco do próprio bot
+      }
+      const s = getSessao(chave);
+      s.silenciadoEm = hojeStr();
+      console.log(`🤐 Humano assumiu a conversa ${chave} — bot silenciado hoje.`);
+      return;
+    }
+
+    // ----- Caso 2: mensagem RECEBIDA do cliente -----
+    if (!texto) return;
+
+    // O número real do cliente está em phone (quando fromMe=false, vem correto)
+    const telefoneCliente = body.phone;
+
+    console.log(`📩 Mensagem de ${telefoneCliente} (conversa ${chave}): ${texto}`);
+
+    const sessao = getSessao(chave);
+
+    // Evita processar a mesma mensagem duas vezes (Z-API às vezes reenvia)
+    if (body.messageId && sessao.ultimoProcessado === body.messageId) {
+      console.log(`🔁 Mensagem repetida ignorada (${body.messageId}).`);
+      return;
+    }
+    sessao.ultimoProcessado = body.messageId || null;
+
+    if (estaSilenciado(sessao)) {
+      console.log(`⏸️ Bot silenciado para ${chave} hoje. Ignorando.`);
+      return;
+    }
+
+    if (sessao.coletaFinalizada) {
+      console.log(`✅ Coleta já finalizada para ${chave}. Aguardando equipe.`);
+      return;
+    }
+
+    sessao.historico.push({ role: "user", content: texto });
+
+    let resposta = await perguntarClaude(sessao.historico);
+
+    const coletou = resposta.includes("[COLETA_COMPLETA]");
+    if (coletou) {
+      resposta = resposta.replace("[COLETA_COMPLETA]", "").trim();
+      sessao.coletaFinalizada = true;
+    }
+
+    sessao.historico.push({ role: "assistant", content: resposta });
+
+    await enviarWhatsApp(telefoneCliente, resposta);
+
+    if (coletou && NUMERO_INTERNO) {
+      const resumo =
+        `🟢 *NOVA DEMANDA — ${telefoneCliente}*\n\n` +
+        `Resumo da conversa de acolhimento:\n\n` +
+        sessao.historico
+          .map((m) => (m.role === "user" ? `Cliente: ${m.content}` : `Bot: ${m.content}`))
+          .join("\n") +
+        `\n\n👉 Equipe: analisar e retornar com orçamento.`;
+      await enviarWhatsApp(NUMERO_INTERNO, resumo);
+      console.log(`📤 Resumo enviado para a loja sobre ${telefoneCliente}.`);
+    }
   } catch (err) {
-    console.error("Erro no raio-x:", err.message);
+    console.error("❌ Erro no webhook:", err.response?.data || err.message);
   }
 });
 
-app.get("/", (_req, res) => res.send("Bot Ox Xerém — modo diagnóstico 🔬"));
+app.get("/", (_req, res) => res.send("Bot Ox Xerém no ar 🟢"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Bot rodando na porta ${PORT} (DIAGNÓSTICO)`));
+app.listen(PORT, () => console.log(`🚀 Bot rodando na porta ${PORT}`));
