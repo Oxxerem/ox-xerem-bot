@@ -29,6 +29,11 @@ const ZAPI_BASE = `https://api.z-api.io/instances/${ZAPI_INSTANCE}/token/${ZAPI_
 const CLAUDE_MODEL = "claude-haiku-4-5";
 const NUMERO_INTERNO = process.env.NUMERO_INTERNO || "";
 
+// Números internos que recebem AVISOS por setor (vêm das variáveis do Render).
+// Financeiro e fiscal caem no mesmo celular do financeiro.
+const NUM_FINANCEIRO = process.env.NUM_FINANCEIRO || "";
+const NUM_FISCAL = process.env.NUM_FISCAL || "";
+
 // ----------------------------------------------------------------------------
 // MEMÓRIA EM TEMPO DE EXECUÇÃO
 // (Zera quando o Render reinicia. Suficiente para conversas curtas.)
@@ -78,6 +83,40 @@ O QUE A OX XERÉM FAZ
 - RECARGA por livre troca: o cliente traz o cilindro vazio e troca por um cheio (lógica de "casco", igual engradado de bebida)
 - ABASTECIMENTO do cilindro próprio do cliente
 NÃO investigue a fundo qual dos três é. Se o cliente disser, anote. Se não disser, tudo bem — a equipe resolve isso na conversa do orçamento. Não faça interrogatório sobre isso.
+
+═══════════════════════════════════
+INFORMAÇÕES INSTITUCIONAIS DA OX XERÉM
+═══════════════════════════════════
+- Endereço: Estrada Rio D'Ouro, nº 50 — Xerém, Duque de Caxias (RJ)
+- Horário: segunda a sexta, das 8h às 17h; sábado, das 8h às 12h
+- Telefone/WhatsApp de contato: (21) 96946-3114
+- Site: www.oxxerem.com.br
+- Instagram: @ox_xerem
+
+CONTATOS POR E-MAIL — REGRAS DE QUANDO REVELAR (siga à risca):
+- vendas.oxxerem@gmail.com → recebe PEDIDOS de clientes. NÃO ofereça esse e-mail por conta própria. O fluxo normal é o cliente fazer o pedido aqui mesmo pelo WhatsApp. Só forneça esse e-mail SE o cliente pedir explicitamente para formalizar o pedido por e-mail.
+- Compras.oxxerem@gmail.com → para FORNECEDORES/VENDEDORES que querem vender para a Ox Xerém, e para envio de CURRÍCULOS. Pode revelar livremente nesses casos.
+- E-mail FINANCEIRO → NUNCA revele o endereço de e-mail. Apenas diga que vai acionar o setor financeiro.
+- E-mail FISCAL → NUNCA revele o endereço de e-mail. Apenas diga que vai encaminhar internamente para o setor responsável.
+
+═══════════════════════════════════
+DIRECIONAMENTO POR TIPO DE CONTATO
+═══════════════════════════════════
+Identifique quem está falando e aja conforme:
+
+1. CLIENTE querendo pedido/orçamento → siga o fluxo normal de acolhimento e coleta (abaixo). Esse é o caso principal.
+
+2. FORNECEDOR/VENDEDOR querendo vender produtos ou serviços PARA a Ox Xerém (ex: representante comercial, oferta de parceria) → seja cordial e breve, explique que você acolhe pedidos de clientes, e oriente a enviar a proposta para Compras.oxxerem@gmail.com. NÃO colete dados de pedido nesse caso.
+
+3. CURRÍCULO / quer trabalhar na empresa → oriente a enviar o currículo para Compras.oxxerem@gmail.com, escrevendo a palavra "CURRÍCULO" no assunto do e-mail. Avise que será encaminhado ao setor responsável e que a equipe entrará em contato caso surja oportunidade compatível.
+
+4. FINANCEIRO / cobrança / boleto / nota / pagamento → NÃO revele e-mail. Diga ao cliente, de forma acolhedora, que você já está acionando o setor financeiro e que a equipe vai retornar. Ao fazer isso, adicione na ÚLTIMA linha da sua mensagem, sozinho, exatamente o marcador: [SETOR_FINANCEIRO]
+
+5. FISCAL / contador / NFe / questão tributária → NÃO revele e-mail. Diga que vai encaminhar internamente para o setor responsável e que retornarão. Ao fazer isso, adicione na ÚLTIMA linha da sua mensagem, sozinho, exatamente o marcador: [SETOR_FISCAL]
+
+Os marcadores [SETOR_FINANCEIRO] e [SETOR_FISCAL] são internos — o cliente nunca deve vê-los na prática (o sistema os remove). Use cada um apenas uma vez, no momento em que acionar o setor.
+
+Quando não tiver certeza do tipo de contato, trate como cliente e siga o acolhimento normal.
 
 ═══════════════════════════════════
 PRODUTOS E MEDIDAS (use a medida certa conforme o gás)
@@ -231,9 +270,33 @@ app.post("/webhook", async (req, res) => {
       sessao.coletaFinalizada = true;
     }
 
+    // Detecta direcionamento de setor (financeiro / fiscal) e remove o marcador
+    const acionouFinanceiro = resposta.includes("[SETOR_FINANCEIRO]");
+    const acionouFiscal = resposta.includes("[SETOR_FISCAL]");
+    if (acionouFinanceiro) resposta = resposta.replace("[SETOR_FINANCEIRO]", "").trim();
+    if (acionouFiscal) resposta = resposta.replace("[SETOR_FISCAL]", "").trim();
+
     sessao.historico.push({ role: "assistant", content: resposta });
 
     await enviarWhatsApp(telefoneCliente, resposta);
+
+    // Dispara aviso interno para o setor acionado (uma vez por conversa)
+    if (acionouFinanceiro && NUM_FINANCEIRO && !sessao.avisouFinanceiro) {
+      sessao.avisouFinanceiro = true;
+      await enviarWhatsApp(
+        NUM_FINANCEIRO,
+        `🔔 *FINANCEIRO* — cliente ${telefoneCliente} pediu atendimento do setor financeiro pelo WhatsApp da loja. Favor assumir a conversa.`
+      );
+      console.log(`📤 Aviso de FINANCEIRO enviado sobre ${telefoneCliente}.`);
+    }
+    if (acionouFiscal && NUM_FISCAL && !sessao.avisouFiscal) {
+      sessao.avisouFiscal = true;
+      await enviarWhatsApp(
+        NUM_FISCAL,
+        `🔔 *FISCAL* — cliente ${telefoneCliente} tem uma questão fiscal/NFe pelo WhatsApp da loja. Favor verificar.`
+      );
+      console.log(`📤 Aviso de FISCAL enviado sobre ${telefoneCliente}.`);
+    }
 
     if (coletou && NUMERO_INTERNO) {
       const resumo =
