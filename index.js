@@ -93,9 +93,10 @@ function pareceSpamDeBot(texto) {
 }
 
 // Controle de frequência por conversa (disjuntor contra loops).
-// Se o bot responder muitas vezes em pouco tempo à mesma conversa, ele para.
-const LIMITE_RESPOSTAS = 6;          // máx. de respostas...
-const JANELA_MS = 3 * 60 * 1000;     // ...dentro de 3 minutos
+// Calibrado para NÃO atrapalhar cliente real (conversa de orçamento é longa),
+// mas ainda cortar loop de robô (que dispara dezenas de respostas em segundos).
+const LIMITE_RESPOSTAS = 12;         // máx. de respostas...
+const JANELA_MS = 2 * 60 * 1000;     // ...dentro de 2 minutos
 
 function podeResponder(sessao) {
   const agora = Date.now();
