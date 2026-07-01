@@ -224,6 +224,11 @@ app.post("/webhook", async (req, res) => {
 
     // ----- Caso 1: mensagem ENVIADA pelo número da loja (fromMe = true) -----
     if (body.fromMe === true) {
+      // RAIO-X TEMPORÁRIO: imprime o evento inteiro para diagnosticar falso positivo
+      console.log("===== EVENTO fromMe =====");
+      console.log(JSON.stringify(body, null, 2));
+      console.log("=========================");
+
       // fromApi=true  -> foi o próprio bot (via API). Ignorar, não é humano.
       // fromApi=false -> foi um humano digitando no celular. Silenciar.
       if (body.fromApi === true) {
