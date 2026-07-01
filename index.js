@@ -33,6 +33,7 @@ const NUMERO_INTERNO = process.env.NUMERO_INTERNO || "";
 // Financeiro e fiscal caem no mesmo celular do financeiro.
 const NUM_FINANCEIRO = process.env.NUM_FINANCEIRO || "";
 const NUM_FISCAL = process.env.NUM_FISCAL || "";
+const NUM_VENDEDOR = process.env.NUM_VENDEDOR || "";
 
 // ----------------------------------------------------------------------------
 // MEMÓRIA EM TEMPO DE EXECUÇÃO
@@ -51,6 +52,7 @@ function getSessao(chave) {
       historico: [],
       silenciadoEm: null,    // data (string) em que o humano assumiu
       coletaFinalizada: false,
+      aguardandoEscolha: false, // se está esperando o cliente escolher no menu pós-orçamento
       ultimoProcessado: null, // messageId já tratado (evita duplicar)
     };
   }
@@ -59,6 +61,50 @@ function getSessao(chave) {
 
 function estaSilenciado(sessao) {
   return sessao.silenciadoEm === hojeStr();
+}
+
+// ----------------------------------------------------------------------------
+// PROTEÇÃO ANTI-LOOP / ANTI-SPAM
+// Detecta mensagens de propaganda automática de outras empresas (outros bots)
+// para o Ox Xerém NÃO responder e entrar em loop infinito (queima de crédito).
+// ----------------------------------------------------------------------------
+function pareceSpamDeBot(texto) {
+  const t = (texto || "").toLowerCase();
+  const sinais = [
+    "linktr.ee",
+    "bit.ly",
+    "wa.me",
+    "fbclid",
+    "confira nossas opções",
+    "confira nossas opcoes",
+    "opções especiais",
+    "opcoes especiais",
+    "agendar uma visita",
+    "nosso vendedor da sua região",
+    "nosso vendedor da sua regiao",
+    "estamos à disposição",
+    "estamos a disposicao",
+    "atenciosamente,",
+    "distribuidora.",
+    "http://",
+    "https://",
+  ];
+  return sinais.some((s) => t.includes(s));
+}
+
+// Controle de frequência por conversa (disjuntor contra loops).
+// Se o bot responder muitas vezes em pouco tempo à mesma conversa, ele para.
+const LIMITE_RESPOSTAS = 6;          // máx. de respostas...
+const JANELA_MS = 3 * 60 * 1000;     // ...dentro de 3 minutos
+
+function podeResponder(sessao) {
+  const agora = Date.now();
+  if (!sessao.timestamps) sessao.timestamps = [];
+  // mantém só os timestamps dentro da janela
+  sessao.timestamps = sessao.timestamps.filter((t) => agora - t < JANELA_MS);
+  if (sessao.timestamps.length >= LIMITE_RESPOSTAS) return false;
+  sessao.timestamps.push(agora);
+  return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -224,11 +270,6 @@ app.post("/webhook", async (req, res) => {
 
     // ----- Caso 1: mensagem ENVIADA pelo número da loja (fromMe = true) -----
     if (body.fromMe === true) {
-      // RAIO-X TEMPORÁRIO: imprime o evento inteiro para diagnosticar falso positivo
-      console.log("===== EVENTO fromMe =====");
-      console.log(JSON.stringify(body, null, 2));
-      console.log("=========================");
-
       // fromApi=true  -> foi o próprio bot (via API). Ignorar, não é humano.
       // fromApi=false -> foi um humano digitando no celular. Silenciar.
       if (body.fromApi === true) {
@@ -248,7 +289,19 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`📩 Mensagem de ${telefoneCliente} (conversa ${chave}): ${texto}`);
 
+    // PROTEÇÃO 1: mensagem de propaganda automática (outro bot) -> não responder
+    if (pareceSpamDeBot(texto)) {
+      console.log(`🚫 Spam/propaganda automática detectada de ${chave}. Ignorando (anti-loop).`);
+      return;
+    }
+
     const sessao = getSessao(chave);
+
+    // PROTEÇÃO 2 (disjuntor): muitas respostas em pouco tempo -> parar (anti-loop)
+    if (!podeResponder(sessao)) {
+      console.log(`⛔ Limite de respostas atingido para ${chave} (possível loop). Pausando.`);
+      return;
+    }
 
     // Evita processar a mesma mensagem duas vezes (Z-API às vezes reenvia)
     if (body.messageId && sessao.ultimoProcessado === body.messageId) {
@@ -262,8 +315,58 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
+    // Após a coleta finalizada: em vez de silenciar, oferece opções ao cliente.
     if (sessao.coletaFinalizada) {
-      console.log(`✅ Coleta já finalizada para ${chave}. Aguardando equipe.`);
+      // Se já mostramos o menu e o cliente está respondendo a escolha:
+      if (sessao.aguardandoEscolha) {
+        const escolha = texto.trim().toLowerCase();
+        const querNovo = escolha === "1" || escolha.includes("novo") || escolha.includes("orçamento") || escolha.includes("orcamento");
+        const querVendedor = escolha === "2" || escolha.includes("vendedor") || escolha.includes("atendente") || escolha.includes("falar");
+
+        if (querNovo) {
+          // Reinicia a coleta do zero
+          sessao.historico = [];
+          sessao.coletaFinalizada = false;
+          sessao.aguardandoEscolha = false;
+          await enviarWhatsApp(
+            telefoneCliente,
+            "Perfeito! Vamos iniciar um novo orçamento. *Qual gás ou produto você precisa?*"
+          );
+          return;
+        }
+
+        if (querVendedor) {
+          sessao.aguardandoEscolha = false;
+          sessao.silenciadoEm = hojeStr(); // sai de cena para o vendedor assumir
+          await enviarWhatsApp(
+            telefoneCliente,
+            "Certo! Já estou acionando um de nossos vendedores, que vai falar com você por aqui em breve. 😊"
+          );
+          if (NUM_VENDEDOR) {
+            await enviarWhatsApp(
+              NUM_VENDEDOR,
+              `🔔 *VENDEDOR* — cliente ${telefoneCliente} pediu para falar com um vendedor (após orçamento) pelo WhatsApp da loja. Favor assumir a conversa.`
+            );
+            console.log(`📤 Aviso de VENDEDOR enviado sobre ${telefoneCliente}.`);
+          }
+          return;
+        }
+
+        // Resposta que não é 1 nem 2: remostra o menu de forma leve
+        await enviarWhatsApp(
+          telefoneCliente,
+          "Só para eu te direcionar: digite *1* para fazer um novo orçamento, ou *2* para falar com um vendedor. Se preferir, é só aguardar nosso retorno."
+        );
+        return;
+      }
+
+      // Primeira interação depois do orçamento: mostra o menu
+      sessao.aguardandoEscolha = true;
+      await enviarWhatsApp(
+        telefoneCliente,
+        "Vi que você voltou! Seu orçamento anterior já está com nossa equipe. Como posso ajudar agora?\n\n*1* - Fazer um novo orçamento\n*2* - Falar com um vendedor\n\nOu, se preferir, é só aguardar nosso retorno."
+      );
+      console.log(`🔄 Menu pós-orçamento oferecido para ${chave}.`);
       return;
     }
 
